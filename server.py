@@ -12,6 +12,7 @@ from langchain_openai import ChatOpenAI
 import numpy as np
 import os
 import httpx
+import asyncio
 import logging
 
 logging.basicConfig(level=logging.INFO)
@@ -46,6 +47,43 @@ def test_db():
     return {"connected": True, "row_count": len(result.data)}
 
 
+def get_claude():
+    return ChatOpenAI(model="gpt-4o-mini", temperature=0)
+
+
+class ParsedSearch(BaseModel):
+    niche: str
+    location: str
+    confident: bool
+
+
+@app.post("/parse-search")
+def parse_search(payload: dict):
+    """Takes a loose, natural-language search request and extracts
+    structured niche + location fields using AI."""
+    raw_text = payload.get("text", "")
+
+    llm = get_claude()
+    structured = llm.with_structured_output(ParsedSearch)
+
+    result = structured.invoke([
+        SystemMessage(content=(
+            "Extract a business niche and a location from the user's request. "
+            "The niche should be a short search term (e.g. 'gyms', 'coffee shops', "
+            "'real estate agencies') — not the full sentence. The location should be "
+            "a city, area, or region. If either piece is missing or too vague to "
+            "extract confidently, set confident to false."
+        )),
+        HumanMessage(content=raw_text),
+    ])
+
+    return {
+        "niche": result.niche,
+        "location": result.location,
+        "confident": result.confident,
+    }
+
+
 async def search_google(niche: str, location: str) -> list[dict]:
     """Searches Google Places for businesses matching niche + location.
     Fetches up to 2 pages (40 results) since Google caps each request at 20."""
@@ -63,7 +101,7 @@ async def search_google(niche: str, location: str) -> list[dict]:
     body = {"textQuery": query}
 
     async with httpx.AsyncClient() as client:
-        for _ in range(2):  # fetch up to 2 pages = up to 40 results
+        for _ in range(2):
             response = await client.post(url, headers=headers, json=body)
             response.raise_for_status()
             data = response.json()
@@ -82,8 +120,6 @@ async def search_google(niche: str, location: str) -> list[dict]:
             if not next_token:
                 break
 
-            # Google requires a short delay before the token becomes valid
-            import asyncio
             await asyncio.sleep(2)
             body = {"textQuery": query, "pageToken": next_token}
 
@@ -135,8 +171,7 @@ async def search_instagram(niche: str, location: str) -> list[dict]:
 
 async def search_facebook(niche: str, location: str) -> list[dict]:
     """Searches Facebook pages via Apify's Facebook Search Scraper —
-    by keyword + location, matching real business pages. Same direct
-    REST pattern as search_instagram (bypasses apify-client library)."""
+    by keyword + location, matching real business pages."""
     token = os.getenv("APIFY_API_TOKEN")
 
     run_url = (
@@ -155,9 +190,6 @@ async def search_facebook(niche: str, location: str) -> list[dict]:
         response.raise_for_status()
         items = response.json()
 
-    # Safety net: log the raw shape of the first result so we can see
-    # exactly what fields this actor actually returns, in case the
-    # mapping below needs adjusting based on real output.
     if items:
         logger.info(f"[DEBUG] Facebook raw item sample: {items[0]}")
 
@@ -184,23 +216,10 @@ async def search_facebook(niche: str, location: str) -> list[dict]:
     return results
 
 
-@app.get("/test-facebook")
-async def test_facebook(niche: str, location: str):
-    """Temporary isolated test route — remove once confirmed working."""
-    try:
-        results = await search_facebook(niche, location)
-        return {"count": len(results), "results": results}
-    except Exception as e:
-        logger.exception("Facebook test failed")
-        return {"error": str(e)}
-
-
 @app.get("/search-leads")
 async def search_leads(niche: str, location: str, sources: str = "google"):
     """Searches across the requested sources (google, instagram, facebook)
-    and returns a combined, unified-shape result list. Any source that
-    isn't yet connected or that errors is reported in unavailable_sources
-    rather than silently ignored."""
+    and returns a combined, unified-shape result list."""
     requested = [s.strip().lower() for s in sources.split(",")]
     unavailable = [s for s in requested if s not in ("google", "instagram", "facebook")]
 
@@ -297,10 +316,6 @@ class SupervisorDecision(BaseModel):
 class ScoreResult(BaseModel):
     score: Literal["hot", "warm", "cold"]
     reason: str
-
-
-def get_claude():
-    return ChatOpenAI(model="gpt-4o-mini", temperature=0)
 
 
 def lead_supervisor(state: LeadState) -> dict:
