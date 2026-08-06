@@ -47,7 +47,8 @@ def test_db():
 
 
 async def search_google(niche: str, location: str) -> list[dict]:
-    """Searches Google Places for businesses matching niche + location."""
+    """Searches Google Places for businesses matching niche + location.
+    Fetches up to 2 pages (40 results) since Google caps each request at 20."""
     api_key = os.getenv("GOOGLE_PLACES_API_KEY")
     query = f"{niche} in {location}"
 
@@ -55,25 +56,36 @@ async def search_google(niche: str, location: str) -> list[dict]:
     headers = {
         "Content-Type": "application/json",
         "X-Goog-Api-Key": api_key,
-        "X-Goog-FieldMask": "places.displayName,places.formattedAddress,places.internationalPhoneNumber,places.websiteUri,places.types",
+        "X-Goog-FieldMask": "places.displayName,places.formattedAddress,places.internationalPhoneNumber,places.websiteUri,places.types,nextPageToken",
     }
+
+    results = []
     body = {"textQuery": query}
 
     async with httpx.AsyncClient() as client:
-        response = await client.post(url, headers=headers, json=body)
-        response.raise_for_status()
-        data = response.json()
+        for _ in range(2):  # fetch up to 2 pages = up to 40 results
+            response = await client.post(url, headers=headers, json=body)
+            response.raise_for_status()
+            data = response.json()
 
-    results = []
-    for place in data.get("places", []):
-        results.append({
-            "business_name": place.get("displayName", {}).get("text"),
-            "address": place.get("formattedAddress"),
-            "phone": place.get("internationalPhoneNumber"),
-            "website": place.get("websiteUri"),
-            "category": place.get("types", [None])[0],
-            "source": "google",
-        })
+            for place in data.get("places", []):
+                results.append({
+                    "business_name": place.get("displayName", {}).get("text"),
+                    "address": place.get("formattedAddress"),
+                    "phone": place.get("internationalPhoneNumber"),
+                    "website": place.get("websiteUri"),
+                    "category": place.get("types", [None])[0],
+                    "source": "google",
+                })
+
+            next_token = data.get("nextPageToken")
+            if not next_token:
+                break
+
+            # Google requires a short delay before the token becomes valid
+            import asyncio
+            await asyncio.sleep(2)
+            body = {"textQuery": query, "pageToken": next_token}
 
     return results
 
